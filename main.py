@@ -19,29 +19,34 @@ try:
 except (FileNotFoundError, json.JSONDecodeError):
     child_to_parent_map = {}
 
-# --- ヘルパー関数 ---
+# --- ★★★★★ ここからが新しいロジック ★★★★★ ---
+
 def save_pairs():
     """親子ペアの情報をJSONファイルに保存する"""
     with open(PAIRS_FILE, 'w') as f:
         json.dump(child_to_parent_map, f, indent=4)
 
 async def sync_nickname(guild, child_id, parent_id):
-    """指定されたペアのニックネームを同期する"""
+    """【改良版】指定されたペアのニックネームを同期する"""
     try:
         parent_member = await guild.fetch_member(int(parent_id))
         child_member = await guild.fetch_member(int(child_id))
         
-        # 親と子が両方サーバーに存在し、かつニックネームが親の名前と違う場合
-        if parent_member and child_member and child_member.nick != parent_member.name:
-            await child_member.edit(nick=parent_member.name)
-            print(f"同期実行: 子 '{child_member.name}' のニックネームを親 '{parent_member.name}' に設定しました。")
+        if not parent_member or not child_member:
+            return
+
+        # 親のニックネームを優先し、なければグローバル名を使う
+        target_name = parent_member.nick or parent_member.name
+
+        if child_member.nick != target_name:
+            await child_member.edit(nick=target_name)
+            print(f"同期実行: 子 '{child_member.name}' のニックネームを '{target_name}' に設定しました。")
+
     except discord.Forbidden:
         print(f"権限エラー: 子 '{child_id}' のニックネームを変更できません。")
     except discord.NotFound:
-        # ユーザーがサーバーにいない場合は何もしない
         pass
 
-# --- イベント処理 ---
 @bot.event
 async def on_ready():
     """BOT起動時の処理"""
@@ -54,31 +59,50 @@ async def on_ready():
 
 @bot.event
 async def on_member_update(before, after):
-    """メンバーの更新（ニックネーム変更など）を検知"""
-    # 更新されたメンバーが「子」か確認
+    """【改良版】メンバーの更新を検知（ニックネーム変更など）"""
+    # -----------------------------------------------------
+    # パターン1: 更新されたメンバーが「子」の場合
+    # -----------------------------------------------------
     child_id = str(after.id)
     if child_id in child_to_parent_map:
         parent_id = child_to_parent_map[child_id]
-        # 子が自分でニックネームを変えた場合などに、親の名前に戻す
-        await sync_nickname(after.guild, child_id, parent_id)
+        # ニックネームが変更されたら、親の最新の名前に同期する
+        if before.nick != after.nick:
+            await sync_nickname(after.guild, child_id, parent_id)
+        return # 子の処理が終わったら、親の処理はしない
+
+    # -----------------------------------------------------
+    # パターン2: 更新されたメンバーが「親」の場合
+    # -----------------------------------------------------
+    parent_id = str(after.id)
+    # このメンバーが誰かの親であるかチェック
+    children_ids = [cid for cid, pid in child_to_parent_map.items() if pid == parent_id]
+    
+    # 親であり、かつニックネームが変更された場合
+    if children_ids and before.nick != after.nick:
+        print(f"親 '{after.name}' のニックネームが変更されました。子の同期を開始します。")
+        for child_id_to_sync in children_ids:
+            await sync_nickname(after.guild, child_id_to_sync, parent_id)
 
 @bot.event
 async def on_user_update(before, after):
-    """ユーザーの更新（グローバルな名前の変更）を検知"""
-    # 更新されたユーザーが「親」か確認
+    """ユーザーのグローバル名変更を検知"""
     parent_id = str(after.id)
-    children_ids = [child_id for child_id, p_id in child_to_parent_map.items() if p_id == parent_id]
-    
-    # 親の名前が変更されたら、その親を持つすべての子を全サーバーで同期する
+    children_ids = [cid for cid, pid in child_to_parent_map.items() if pid == parent_id]
+
+    # 親のグローバル名が変わり、かつニックネームが設定されていない場合のみ同期
     if children_ids and before.name != after.name:
-        print(f"親 '{before.name}' が '{after.name}' に改名しました。子の同期を開始します。")
+        print(f"親 '{before.name}' のグローバル名が '{after.name}' に変更されました。子の同期を試みます。")
         for guild in bot.guilds:
-            for child_id in children_ids:
-                await sync_nickname(guild, child_id, parent_id)
+            parent_member = await guild.fetch_member(int(parent_id))
+            # 親にニックネームが設定されていない場合のみ、グローバル名の変更を反映
+            if parent_member and parent_member.nick is None:
+                for child_id_to_sync in children_ids:
+                    await sync_nickname(guild, child_id_to_sync, parent_id)
 
-# --- 管理者用コマンド ---
+# --- ★★★★★ ここまでが新しいロジック ★★★★★ ---
 
-# 管理者権限を持つユーザーのみが使えるように設定
+# --- 管理者用コマンド (変更なし) ---
 admin_permissions = discord.Permissions(administrator=True)
 
 @bot.slash_command(name="set_pair", description="[管理者用] 親と子のペアを登録・更新します。", default_member_permissions=admin_permissions)
@@ -91,7 +115,6 @@ async def set_pair(ctx, parent: discord.Member, child: discord.Member):
     save_pairs()
     
     await ctx.respond(f"ペアを登録しました。\n親: {parent.mention}\n子: {child.mention}\nただちに同期します。", ephemeral=True)
-    # すぐに同期を実行
     await sync_nickname(ctx.guild, str(child.id), str(parent.id))
 
 @bot.slash_command(name="remove_pair", description="[管理者用] 子の同期設定を解除します。", default_member_permissions=admin_permissions)
@@ -118,7 +141,7 @@ async def list_pairs(ctx):
     embed.description = description
     await ctx.respond(embed=embed, ephemeral=True)
 
-# --- BOTの実行 ---
+# --- BOTの実行 (変更なし) ---
 bot_token = os.environ.get("DISCORD_BOT_TOKEN")
 if bot_token is None:
     print("エラー: 環境変数 'DISCORD_BOT_TOKEN' が設定されていません。")
